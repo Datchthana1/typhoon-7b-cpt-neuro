@@ -1,0 +1,69 @@
+# ============================================================================
+# Optuna search space — อ่านคู่กับ docs/06_OPTUNA_HPO.md
+# ============================================================================
+optuna:
+  study_name: typhoon7b-cpt-neuro
+  n_trials: 25
+  n_startup_trials: 6        # 6 trial แรกสุ่มล้วน (TPE ยังไม่มีข้อมูลพอ) และยังไม่ prune
+  pruner_warmup_evals: 2     # ให้แต่ละ trial eval อย่างน้อย 2 ครั้งก่อนพิจารณาตัด
+
+  # แต่ละ trial เทรนสั้น ๆ บน subset — ค่าที่ดีบน subset มัก transfer ไป full run ได้
+  # 25 trials × ~150 step ≈ 4-6 ชม. บน RTX 4060 8GB
+  max_steps_per_trial: 150
+  subset_ratio: 0.35
+
+  # น้ำหนักลงโทษ catastrophic forgetting
+  #   score = domain_loss + λ · max(0, general_loss − general_loss_baseline)
+  # λ=0 สนใจโดเมนใหม่อย่างเดียว | λ=2 สมดุล | λ=5 หวงความสามารถเดิมมาก
+  forgetting_penalty: 2.0
+
+  search_space:
+    # --- ตัวที่สำคัญที่สุด: อัตราการเรียนรู้ ---
+    # log scale เพราะผลของ lr เป็นเชิงคูณไม่ใช่เชิงบวก
+    learning_rate:
+      type: float
+      low: 3.0e-5
+      high: 4.0e-4
+      log: true
+
+    # --- capacity ของ adapter ---
+    # r ต่ำ = เรียนสำนวนได้แต่เก็บความรู้ใหม่ไม่พอ | r สูง = กิน VRAM และเสี่ยง overfit corpus เล็ก
+    lora_r:
+      type: categorical
+      choices: [16, 32, 64]
+
+    # alpha = r × ratio (ให้ Optuna เลือกอัตราส่วน ไม่ใช่ค่าสัมบูรณ์
+    #  เพราะ alpha ที่เหมาะสมขึ้นกับ r เสมอ — ค้นแยกกันจะได้ combination ที่ไม่มีความหมาย)
+    alpha_ratio:
+      type: categorical
+      choices: [1, 2, 4]
+
+    lora_dropout:
+      type: float
+      low: 0.0
+      high: 0.10
+
+    # --- ขนาด batch ที่แท้จริง ---
+    # micro_batch ถูกล็อกที่ 1 เพราะ VRAM จำกัด จึงปรับผ่าน grad_accum แทน
+    grad_accum:
+      type: categorical
+      choices: [8, 16, 32]
+
+    lr_scheduler:
+      type: categorical
+      choices: [cosine, linear, constant_with_warmup]
+
+    warmup_ratio:
+      type: float
+      low: 0.01
+      high: 0.12
+
+    weight_decay:
+      type: float
+      low: 0.0
+      high: 0.10
+
+    max_grad_norm:
+      type: float
+      low: 0.3
+      high: 1.0

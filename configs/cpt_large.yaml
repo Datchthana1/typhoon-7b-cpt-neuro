@@ -1,0 +1,65 @@
+# ============================================================================
+# คอนฟิกสำหรับรันยาว (หลายวัน) เป้าหมาย: domain PPL ≈ 5
+#
+# ต่างจาก configs/cpt.yaml ตรงที่ออกแบบมาสำหรับคลัง 30–40M token
+# ซึ่งเปลี่ยนสมมติฐานพื้นฐานหลายข้อ:
+#   • overfitting ไม่ใช่ความเสี่ยงหลักอีกต่อไป → เพิ่ม lora_r ได้
+#   • 1 epoch ใช้เวลาหลายสิบชั่วโมง → epochs = 1 ก็พอ
+#   • ต้อง checkpoint ถี่พอที่จะกู้คืนได้ถ้าไฟดับ
+# ============================================================================
+seed: 42
+
+model:
+  name: typhoon-ai/typhoon-7b
+  cache_dir: null
+
+paths:
+  book_dir: book
+  raw_dir: data/raw
+  processed_dir: data/processed_large
+  replay_dir: data/replay
+  output_dir: outputs_large
+
+clean:
+  min_chars: 800
+  min_thai_ratio: 0.60
+  keep_heading: true
+
+dedup:
+  ngram: 5
+  num_perm: 128
+  jaccard_threshold: 0.85
+
+data:
+  seq_len: 1024
+  val_ratio: 0.02          # 2% ของคลังใหญ่ = val หลายร้อยบล็อก (เดิม 1 บล็อก)
+  replay_ratio: 0.05       # ลดลงเพราะคลังโดเมนใหญ่พอที่จะไม่ทำให้ลืมของเดิมรุนแรง
+
+train:
+  micro_batch_size: 1
+  epochs: 1                # 1 epoch บน ~35M token ≈ 34,000 step
+  eval_steps: 500
+  logging_steps: 50
+  save_steps: 1000         # checkpoint ทุก ~5 ชม. — กู้คืนได้ถ้าไฟดับ
+
+# ---------------------------------------------------------------------------
+# Hyperparameter สำหรับรันยาว
+#
+# เหตุผลที่ต่างจาก cpt.yaml:
+#   lora_r 64  — คลังใหญ่รองรับ capacity สูงได้โดยไม่ overfit
+#                และ capacity คือข้อจำกัดหลักของการกด PPL ลงต่ำ ๆ
+#   lr 8e-5    — สูงกว่ารันสั้น (1.5e-5) ได้ เพราะ step เยอะทำให้ scheduler
+#                มีเวลาลด lr ลงมาเอง และข้อมูลเยอะกันการท่องจำ
+#   cosine     — ลด lr เหลือเกือบ 0 ตอนท้าย ช่วยให้ loss ลงได้ลึกกว่า
+# ---------------------------------------------------------------------------
+hp:
+  learning_rate: 8.0e-5
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  grad_accum: 8            # effective batch = 8 × 1024 = 8,192 token/step
+  lr_scheduler: cosine
+  warmup_ratio: 0.02
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  use_rslora: true
