@@ -16,6 +16,7 @@ data/replay/*.jsonl
 # ไฟล์ wiki ที่ดึงมาเอง ใหญ่เกิน 100MB (ลิมิตของ GitHub) — regenerate ได้ด้วย prepare_data.py
 data/raw/wiki_domain.jsonl
 data/domain/wiki_domain.jsonl
+data/domain_old_unfiltered/
 *.safetensors
 *.gguf
 *.db

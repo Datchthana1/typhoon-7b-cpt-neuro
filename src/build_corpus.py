@@ -57,13 +57,18 @@ TAIL_SECTIONS = re.compile(
 LIST_LINE = re.compile(r"^\s*([-*•·]|\d+[.)]|\|)")
 
 
-def score(text: str) -> int:
+def score(text: str) -> tuple[int, int]:
+    """คืน (คะแนนรวม, จำนวนคำ CORE ที่เจอ)
+
+    เดิมใช้แค่คะแนนรวมอย่างเดียว บทความสัตว์/ชีววิทยาทั่วไป (เต่า, แมงกะพรุน, ...)
+    สะสมคะแนนผ่านเกณฑ์ได้ง่ายจากคำกว้างอย่าง "วิวัฒนาการ"+"เซลล์"+"เลือด" โดยไม่มีคำ
+    เฉพาะทางประสาทวิทยาเลยสักคำ ทำให้คลังเจือจางจนไม่เหลือความเป็นโดเมนจริง
+    ต้องเจอ CORE อย่างน้อย 1 คำด้วยเสมอ ไม่ใช่แค่สะสมคะแนนจาก MID/WEAK
+    """
     head = text[:6000]
-    return (
-        3 * sum(1 for k in CORE if k in head)
-        + 2 * sum(1 for k in MID if k in head)
-        + sum(1 for k in WEAK if k in head)
-    )
+    n_core = sum(1 for k in CORE if k in head)
+    total = 3 * n_core + 2 * sum(1 for k in MID if k in head) + sum(1 for k in WEAK if k in head)
+    return total, n_core
 
 
 def clean_wiki(text: str) -> str:
@@ -90,7 +95,12 @@ def clean_wiki(text: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--target-chars", type=int, default=120_000_000)
-    ap.add_argument("--min-score", type=int, default=6, help="คะแนนขั้นต่ำ (สูง = โดเมนแคบลง)")
+    ap.add_argument("--min-score", type=int, default=10, help="คะแนนขั้นต่ำ (สูง = โดเมนแคบลง)")
+    ap.add_argument(
+        "--min-core-hits", type=int, default=1,
+        help="ต้องเจอคำ CORE (ศัพท์ประสาทวิทยาเฉพาะทาง) อย่างน้อยกี่คำ — กันบทความชีววิทยาทั่วไป"
+        " (เต่า, แมงกะพรุน, ...) ที่สะสมคะแนนผ่านจาก MID/WEAK ล้วนโดยไม่มีคำเฉพาะทางเลย",
+    )
     ap.add_argument("--min-chars", type=int, default=2500, help="ความยาวขั้นต่ำหลัง clean")
     ap.add_argument("--out", default="data/domain")
     args = ap.parse_args()
@@ -120,7 +130,10 @@ def main() -> int:
             if len(raw) < args.min_chars:
                 stats["สั้นเกิน"] += 1
                 continue
-            s = score(raw)
+            s, n_core = score(raw)
+            if n_core < args.min_core_hits:
+                stats["ไม่มีคำ CORE"] += 1
+                continue
             if s < args.min_score:
                 stats["คะแนนโดเมนต่ำ"] += 1
                 continue
@@ -129,7 +142,7 @@ def main() -> int:
                 stats["เหลือน้อยหลัง clean"] += 1
                 continue
 
-            rec = {"id": f"wiki-{row['id']}", "text": text, "source": "wiki_domain", "score": s}
+            rec = {"id": f"wiki-{row['id']}", "text": text, "source": "wiki_domain", "score": s, "core_hits": n_core}
             # ทุกเอกสารที่ 40 กันไว้เป็น val — สุ่มแบบ deterministic ไม่ต้องโหลดทั้งหมดก่อน
             if n_kept % 40 == 0 and n_val < 400:
                 fval.write(json.dumps(rec, ensure_ascii=False) + "\n")

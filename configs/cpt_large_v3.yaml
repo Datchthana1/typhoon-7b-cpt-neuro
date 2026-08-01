@@ -1,0 +1,98 @@
+# ============================================================================
+# v3 — แก้ไขทั้งหมดจากบทเรียนของ v2 (ผลลบ, ดู RESULTS.md §11)
+#
+# สิ่งที่เปลี่ยนจาก v2 และเหตุผล:
+#
+#   1. คลังข้อมูลถูกสร้างใหม่ทั้งหมด — v2 ใช้ data/raw/wiki_domain.jsonl ที่มี 8,127
+#      เอกสาร (130MB) ซึ่งตรวจพบว่า >99% เป็น Wikipedia ทั่วไปที่ไม่เกี่ยวกับโดเมนเลย
+#      (บทความเต่า, David Bowie, หนัง, วิดีโอเกม ฯลฯ) เพราะตัวกรองใน build_corpus.py
+#      เดิมใช้แค่คะแนนสะสมจากคำกว้าง ๆ ("วิวัฒนาการ"+"เซลล์"+"เลือด") โดยไม่ต้องมีคำ
+#      เฉพาะทางประสาทวิทยาเลยสักคำ — แก้แล้วให้ต้องมีคำ CORE อย่างน้อย 1 คำ (ดู
+#      src/build_corpus.py) คลังใหม่เหลือ 606 เอกสาร/1.77M token ที่เกี่ยวข้องจริง
+#      (สุ่มตรวจ 30 เอกสาร พบว่าเกี่ยวข้องจริง/ใกล้เคียง ~55% ที่เหลือเป็นเอกสาร
+#      วิทยาศาสตร์-การแพทย์ทั่วไปที่ไม่ตรงประเด็นแต่ไม่ใช่ขยะสุ่มแบบเดิม)
+#      รวมกับ 42 ไฟล์บทหนังสือใน data/raw/*.md (บางบทยังเป็น draft สั้น ไม่ใช่ทุกบท
+#      เขียนจบเต็มที่) → รวม 1,746 train บล็อก (1.79M token) เทียบกับ 15,607 บล็อก
+#      ของ v2 ที่ token ส่วนใหญ่ไม่เกี่ยวข้องเลย
+#
+#   2. learning_rate ลดจาก 8e-5 → 2e-5 — v2 พิสูจน์ชัดว่า 8e-5 สูงเกินไป: eval_loss
+#      พุ่งขึ้นช่วง warmup (step 0-150) แล้วไม่เคยฟื้นกลับไปต่ำกว่า baseline เลยตลอด
+#      5,853 step แม้แต่ checkpoint ที่ดีที่สุด — ตรงกับรูปแบบที่เคยพังตอน lr=1e-4
+#      ใน RESULTS.md §3 (เชิงรุกเกินไป, catastrophic) เลือก 2e-5 อยู่กึ่งกลางระหว่าง
+#      1.5e-5 (อนุรักษ์ ที่เคยได้ผลดีใน RESULTS.md §4) กับ 3e-5 (ขอบล่างของ search
+#      space Optuna เดิม) เผื่อคลังใหม่ที่สะอาดกว่าจะรับ lr สูงกว่านิดหน่อยได้
+#
+#   3. lora_r ลดจาก 64 → 32 — คลังจริง (1.79M token) เล็กกว่าที่ v2 ออกแบบไว้มาก
+#      (คอมเมนต์เดิมสมมติ 30-40M token ซึ่งไม่เคยมีจริง) capacity สูงบนคลังเล็ก
+#      เสี่ยง overfit ตรงกับที่ docs/06_OPTUNA_HPO.md เตือนไว้ ("r สูง = overfit
+#      คลังเล็ก") — ใช้ alpha=64 คงอัตราส่วน alpha/r=2 เท่าเดิม
+#
+#   4. epochs เพิ่มจาก 1 → 15 — ไม่จำกัดเวลาในการเทรนตามที่ผู้ใช้ระบุ และคลังเล็กลง
+#      มาก (~219 step/epoch แทน 1,950) ทำให้ 1 epoch เดียวให้ข้อมูล gradient น้อย
+#      เกินไป 15 epoch ยังใช้เวลารวมน้อยกว่า v2 เดิม (5,853 step) ประมาณครึ่งหนึ่ง
+#      ต้องจับตา eval_loss ใกล้ชิด (ดูข้อ 5) เพราะ epoch เยอะบนคลังเล็กเสี่ยง
+#      ท่องจำ — load_best_model_at_end จะเลือก checkpoint ที่ดีที่สุดให้อัตโนมัติ
+#      ถ้า eval_loss เริ่มขึ้นก่อนครบ 15 epoch ก็ไม่เป็นไร ระบบจะไม่ใช้ checkpoint
+#      ที่ overfit แล้วอยู่ดี
+#
+#   5. eval_steps/save_steps ลดจาก 500 → 50 — คลังเล็กลงมาก (219 step/epoch)
+#      eval ทุก 500 step เดิมจะเห็นแค่ ~6 จุดตลอดการเทรน ไม่พอจับสัญญาณ overfit
+#      ทัน ลดเหลือ 50 step ให้เห็นทุก ๆ ~23% ของ epoch แทน
+#
+#   6. data.replay_ratio คงที่ 0.05 (ใช้ค่านี้ตอนเตรียมข้อมูลไปแล้ว) — บั๊ก data
+#      leakage ที่ general_val.jsonl หลุดเข้าไปในชุด replay ระหว่างเทรนถูกแก้แล้ว
+#      ใน src/prepare_data.py (บรรทัดยกเว้นไฟล์ general_val* ออกจาก replay)
+#
+# ทุกอย่างที่แก้เรื่อง crash-resilience ใน train_cpt.py (save_only_model,
+# find_resumable_checkpoint, LR fast-forward ตอน resume, MetricHistoryCallback)
+# ใช้ร่วมกับ config นี้ได้ทันที ไม่ต้องแก้อะไรเพิ่ม
+# ============================================================================
+seed: 42
+
+model:
+  name: typhoon-ai/typhoon-7b
+  cache_dir: null
+
+paths:
+  book_dir: book
+  raw_dir: data/raw
+  processed_dir: data/processed_large_v2
+  replay_dir: data/replay
+  output_dir: outputs_large_v3
+
+clean:
+  min_chars: 800
+  min_thai_ratio: 0.60
+  keep_heading: true
+
+dedup:
+  ngram: 5
+  num_perm: 128
+  jaccard_threshold: 0.85
+
+data:
+  seq_len: 1024
+  val_ratio: 0.02
+  replay_ratio: 0.05
+
+train:
+  micro_batch_size: 1
+  epochs: 15               # ไม่จำกัดเวลา + คลังเล็กลงมาก → เพิ่ม epoch แทน (ดูข้อ 4 ด้านบน)
+  eval_steps: 50           # คลังเล็กลง (219 step/epoch) ต้อง eval ถี่ขึ้นเพื่อจับ overfit ทัน
+  logging_steps: 20
+  save_steps: 50
+
+# ---------------------------------------------------------------------------
+# Hyperparameter — ปรับจากบทเรียนของ v2 ทั้งหมด (ดูคอมเมนต์หัวไฟล์ข้อ 2-3)
+# ---------------------------------------------------------------------------
+hp:
+  learning_rate: 2.0e-5
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  grad_accum: 8            # effective batch = 8 × 1024 = 8,192 token/step
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  use_rslora: true
