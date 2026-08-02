@@ -42,3 +42,4 @@ runs/
 .claude/
 Thumbs.db
 desktop.ini
+data/factbook_sft/
