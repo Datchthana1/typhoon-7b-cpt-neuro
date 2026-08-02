@@ -57,25 +57,46 @@ def build_example(rec: dict) -> tuple[str, str]:
 class SFTDataset(torch.utils.data.Dataset):
     """tokenize แล้ว mask prompt ทิ้ง — เก็บเป็น list ความยาวไม่เท่ากัน (pad ตอน collate)"""
 
+    # เผื่อระยะห่างจาก max_len เสมอ กันกรณี prompt สั้นกว่า max_len แค่นิดเดียว
+    # จน truncate แล้วเหลือ response ไม่กี่ token (สัญญาณ loss จะอ่อนเกินจะใช้ได้จริง)
+    MIN_RESPONSE_TOKENS = 8
+
     def __init__(self, path: Path, tok, max_len: int):
         self.rows = []
-        n_trunc = 0
+        n_trunc = n_skipped = 0
         for line in open(path, encoding="utf-8"):
             rec = json.loads(line)
             prompt, response = build_example(rec)
             p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
             r_ids = tok(response, add_special_tokens=False)["input_ids"]
+
+            # ⚠️ บั๊กที่เคยเกิดจริง: ถ้า prompt เพียงอย่างเดียวยาวใกล้/เกิน max_len
+            # การตัดท้ายจะทำให้เหลือ response 0 token → labels ทั้งแถวเป็น -100 หมด
+            # → cross-entropy หารด้วยศูนย์ (ไม่มี token ให้คิด loss เลย) → NaN
+            # แล้ว NaN แพร่เข้า gradient ทำให้น้ำหนักโมเดลพังถาวรตั้งแต่ step แรกที่เจอ
+            # (เกิดขึ้นจริงกับ 30/21,526 แถวตอนรันจริง ทำให้เทรนพังตั้งแต่ step ~100)
+            # ทางแก้ที่ถูกต้องคือ "ข้ามแถวนี้ไปเลย" ไม่ใช่ตัดแล้วฝืนใช้
+            if len(p_ids) + self.MIN_RESPONSE_TOKENS > max_len:
+                n_skipped += 1
+                continue
+
             ids = p_ids + r_ids
             if len(ids) > max_len:
-                # ตัดจากท้าย (คำตอบ) ไม่ใช่จากหัว — คำถามต้องอยู่ครบไม่งั้น context หาย
-                ids = ids[:max_len]
+                ids = ids[:max_len]        # ตัดจากท้าย (คำตอบ) เท่านั้น การันตีแล้วว่าเหลือ >= MIN_RESPONSE_TOKENS
                 n_trunc += 1
             # -100 = ไม่คิด loss (ค่าที่ PyTorch cross-entropy ใช้เป็น ignore_index)
-            labels = [-100] * min(len(p_ids), len(ids)) + ids[len(p_ids):]
+            labels = [-100] * len(p_ids) + ids[len(p_ids):]
             self.rows.append({"input_ids": ids, "labels": labels})
+
+        if n_skipped:
+            LOG.warning("ข้าม %d แถวที่ prompt เดียวก็เกือบ/เกิน max_len=%d แล้ว (จะทำให้ response เหลือ token ไม่พอ)",
+                        n_skipped, max_len)
         if n_trunc:
             LOG.warning("ตัดท้าย %d แถว (%.1f%%) ที่ยาวเกิน max_len=%d",
                         n_trunc, 100 * n_trunc / len(self.rows), max_len)
+        # กันไว้อีกชั้น: assert ว่าไม่มีแถวไหนหลุดรอดมาแบบ fully-masked จริง ๆ
+        assert all(any(l != -100 for l in r["labels"]) for r in self.rows), \
+            "เจอแถวที่ labels เป็น -100 ทั้งแถว — ตรวจ logic ข้างบนใหม่"
 
     def __len__(self):
         return len(self.rows)
