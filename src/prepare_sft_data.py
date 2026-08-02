@@ -43,6 +43,129 @@ WEAK = [  # น้ำหนัก 1 — ทั่วไป อาจไม่ใ
 
 INST_RE = re.compile(r"<s>\s*\[INST\](.*?)\[/INST\](.*?)</s>", re.S)
 
+# --------------------------------------------------------------------------- #
+# สร้าง thinking จาก reasoning ที่หมอเขียนไว้ในคำตอบอยู่แล้ว
+#
+# ⚠️ ข้อจำกัดที่ต้องเข้าใจ: นี่คือการ **จัดโครงสร้างใหม่จากคำตอบจริง** (extractive)
+# ไม่ใช่การสร้าง reasoning ใหม่ด้วย LLM ที่เก่งกว่า (distillation) — เพราะเครื่องนี้
+# ไม่มี API key ของโมเดลใดเลย ข้อดีคือไม่มีความเสี่ยงว่า thinking จะขัดกับคำตอบ
+# (ทุกประโยคมาจากคำตอบจริง) ข้อเสียคือรูปแบบจะค่อนข้างตายตัว โมเดลจะเรียน
+# "ฟอร์แมตของการคิด" ได้ แต่ไม่ได้เรียนการให้เหตุผลที่หลากหลายเท่า distillation จริง
+# ถ้าต้องการคุณภาพระดับนั้น ต้องมี API key แล้วเขียน distillation script เพิ่ม
+# --------------------------------------------------------------------------- #
+GREETING_RE = re.compile(r"^\s*(สวัสดี(ค่ะ|ครับ|คะ)?|ฉันเข้าใจ[^ก-๙]{0,20})\s*")
+
+# คำตอบในชุดนี้เป็น run-on text ล้วน — ไม่มีขึ้นบรรทัด ไม่มีเว้นวรรคคู่ ไม่มีจุดจบประโยค
+# (ตรวจจากข้อมูลจริง: newlines=0, doublespace=0 ในเกือบทุกแถว)
+# จึงตัดที่ "discourse marker" ที่หมอใช้เปลี่ยนประเด็นแทนการตัดประโยคแบบปกติ
+CUES: list[tuple[str, re.Pattern]] = [
+    ("flag", re.compile(
+        r"(ควรรีบไปพบแพทย์|รีบไปพบแพทย์|รีบพบแพทย์|ควรไปพบแพทย์|ควรพบแพทย์"
+        r"|สังเกตอาการ|หากมีอาการ|ถ้ามีอาการ|หากอาการ|ถ้าอาการ)")),
+    ("plan", re.compile(
+        r"(เบื้องต้นแนะนำ|แนะนำให้|แนะนำการ|ขอแนะนำ|แนะนำ|ควรปฏิบัติ"
+        r"|การดูแลตัวเอง|การดูแลเบื้องต้น|วิธีแก้|เบื้องต้นควร)")),
+    # "สาเหตุ" เดี่ยว ๆ ตะกละเกินไป (ไปจับกลางวลีอย่าง "สาเหตุ หรืออาจหลบซ่อนตัว")
+    # จึงบังคับให้ต้องมีบริบทที่บ่งว่ากำลังจะแจกแจงจริงตามหลัง
+    ("cause", re.compile(
+        r"(อาจเกิดจาก|มักเกิดจาก|เกิดได้จาก|น่าจะเกิดจาก|เกิดจาก"
+        r"|สาเหตุ(อื่น|ที่พบบ่อย|ได้แก่|เช่น|จาก|คือ|หลัก)"
+        r"|เข้าได้กับ|อาจเป็น|มักเป็น|อาจจะเป็น)")),
+]
+
+
+# thai-med-pack ผสมคำตอบ 2 แบบ: หมอไทยเขียนเอง (ภาษาเป็นธรรมชาติ) กับที่แปลจากอังกฤษ
+# ด้วยเครื่อง (สำนวนแข็ง แปลศัพท์ผิด เช่น "โซเดียมต่ำ (ภาวะโพแทสเซียมในเลือดต่ำ)")
+# ตัวหลังทำให้ thinking ที่สกัดออกมาเสียคุณภาพ จึงคัดออกก่อน
+MT_ARTIFACTS = re.compile(
+    r"(หวังว่าฉันจะ|เรายินดีที่จะช่วยเหลือคุณต่อไป|ขอให้คุณมีสุขภาพที่ดี"
+    r"|ฉันเข้าใจสถานการณ์|หวังว่าสิ่งนี้จะช่วย|ขอบคุณ\.|โปรดอย่าลังเลที่จะ"
+    r"|ด้วยความเคารพ|ปรึกษาแพทย์ผู้เชี่ยวชาญด้าน)"
+)
+# หมอไทยในชุดนี้ลงท้ายด้วย ค่ะ/ครับ เสมอ — ใช้เป็นสัญญาณว่าเป็นภาษาไทยต้นฉบับ
+NATIVE_THAI = re.compile(r"(ค่ะ|ครับ|นะคะ|นะครับ)")
+
+
+def looks_native_thai(answer: str) -> bool:
+    """คัดเฉพาะคำตอบที่หมอไทยเขียนเอง ไม่ใช่ที่แปลจากอังกฤษด้วยเครื่อง"""
+    if MT_ARTIFACTS.search(answer):
+        return False
+    return bool(NATIVE_THAI.search(answer))
+
+
+def _trim_at_boundary(seg: str, limit: int) -> str:
+    """ตัดข้อความไม่ให้ยาวเกิน limit โดยตัดที่ช่องว่างสุดท้าย ไม่ตัดกลางคำ/กลางวลี"""
+    if len(seg) <= limit:
+        return seg
+    cut = seg[:limit]
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp > limit * 0.6 else cut).rstrip()
+
+
+def _segments(body: str) -> list[tuple[str, str]]:
+    """หาตำแหน่ง cue ทั้งหมด แล้วตัดข้อความจาก cue หนึ่งไปถึง cue ถัดไป
+
+    คืน [(ชนิด, ข้อความ), ...] เรียงตามตำแหน่งที่ปรากฏจริงในคำตอบ
+    """
+    hits: list[tuple[int, str]] = []
+    for kind, pat in CUES:
+        for m in pat.finditer(body):
+            hits.append((m.start(), kind))
+    if not hits:
+        return []
+    hits.sort()
+
+    # กัน cue ที่ซ้อนใกล้กันเกินไป (เช่น "แนะนำ" ซ้อนใน "เบื้องต้นแนะนำ")
+    dedup: list[tuple[int, str]] = []
+    for pos, kind in hits:
+        if dedup and pos - dedup[-1][0] < 12:
+            continue
+        dedup.append((pos, kind))
+
+    out = []
+    for i, (pos, kind) in enumerate(dedup):
+        end = dedup[i + 1][0] if i + 1 < len(dedup) else len(body)
+        seg = _trim_at_boundary(body[pos:end].strip(), 320)
+        if len(seg) > 25:
+            out.append((kind, seg))
+    return out
+
+
+def build_thinking(instruction: str, answer: str) -> str | None:
+    """ดึง reasoning ที่มีอยู่จริงในคำตอบออกมาเรียงเป็นขั้นตอน
+
+    คืน None ถ้าหาโครงสร้างไม่เจอ — กรณีนั้นจะเทรนเป็น Q&A ธรรมดาแทน
+    ดีกว่าใส่ thinking กลวง ๆ ที่ไม่ได้สะท้อนการคิดจริง
+    """
+    if not looks_native_thai(answer):
+        return None
+    body = GREETING_RE.sub("", answer).strip()
+    segs = _segments(body)
+    if not segs:
+        return None
+
+    causes = [s for k, s in segs if k == "cause"]
+    plans = [s for k, s in segs if k == "plan"]
+    flags = [s for k, s in segs if k == "flag"]
+
+    # ต้องมีอย่างน้อย "สาเหตุที่เป็นไปได้" หรือ "แนวทาง" ถึงจะถือว่ามี reasoning พอ
+    if not causes and not plans:
+        return None
+
+    lines = []
+    q_head = re.sub(r"\s+", " ", instruction).strip()
+    lines.append(f"ผู้ถามเล่าอาการ: {q_head[:220]}{'...' if len(q_head) > 220 else ''}")
+    if causes:
+        lines.append("แยกสาเหตุที่เป็นไปได้:")
+        lines += [f"- {c[:300]}" for c in causes[:5]]
+    if flags:
+        lines.append("อาการที่ต้องเฝ้าระวัง:")
+        lines += [f"- {f[:250]}" for f in flags[:2]]
+    if plans:
+        lines.append("แนวทางที่จะแนะนำ:")
+        lines += [f"- {p[:250]}" for p in plans[:3]]
+    return "\n".join(lines)
+
 
 def score(instruction: str, answer: str) -> tuple[int, int]:
     text = instruction + " " + answer
@@ -69,6 +192,7 @@ def main() -> int:
     ap.add_argument("--min-answer-chars", type=int, default=80)
     ap.add_argument("--max-answer-chars", type=int, default=3000)
     ap.add_argument("--val-ratio", type=float, default=0.05)
+    ap.add_argument("--no-thinking", action="store_true", help="ไม่ต้องสร้าง thinking (เทรน Q&A ล้วน)")
     ap.add_argument("--out", default="data/sft")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -97,10 +221,18 @@ def main() -> int:
         if n_core < args.min_core_hits or total < args.min_score:
             n_low_score += 1
             continue
-        kept.append({"instruction": instruction, "answer": answer, "score": total, "core_hits": n_core})
+        rec = {"instruction": instruction, "answer": answer, "score": total, "core_hits": n_core}
+        if not args.no_thinking:
+            thinking = build_thinking(instruction, answer)
+            if thinking:
+                rec["thinking"] = thinking
+        kept.append(rec)
 
+    n_think = sum(1 for r in kept if "thinking" in r)
     print(f"เก็บ {len(kept):,} คู่ | ทิ้ง: parse_fail={n_parse_fail:,} สั้นเกิน={n_too_short:,} "
           f"ยาวเกิน={n_too_long:,} คะแนนต่ำ={n_low_score:,}")
+    print(f"สร้าง thinking ได้ {n_think:,} คู่ ({100*n_think/max(1,len(kept)):.1f}%) "
+          f"— ที่เหลือเทรนเป็น Q&A ธรรมดา (หาโครงสร้าง reasoning ในคำตอบไม่เจอ)")
 
     random.seed(args.seed)
     random.shuffle(kept)
