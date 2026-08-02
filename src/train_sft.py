@@ -154,6 +154,88 @@ def find_resumable_checkpoint(out_dir: Path) -> str | None:
     return None
 
 
+def build_model(cfg: Config, no_init_adapter: bool = False):
+    """สร้าง base (4-bit) + ต่อ adapter ของ CPT (หรือ LoRA ใหม่) — แยกออกมาจาก main()
+    ให้ src/hpo_optuna_sft.py เรียกใช้ซ้ำได้ ไม่ต้องก็อปโค้ดโหลดโมเดล"""
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model.name,
+        quantization_config=bnb,
+        dtype=torch.bfloat16,
+        device_map={"": 0},
+        cache_dir=cfg.model.get("cache_dir"),
+    )
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    init_adapter = cfg.model.get("init_adapter")
+    if init_adapter and not no_init_adapter:
+        LOG.info("ต่อจาก adapter ของ CPT: %s", init_adapter)
+        model = PeftModel.from_pretrained(model, init_adapter, is_trainable=True)
+    else:
+        LOG.info("เริ่ม LoRA ใหม่จาก base (ไม่ได้ต่อจาก CPT)")
+        model = get_peft_model(model, LoraConfig(
+            r=cfg.hp.lora_r,
+            lora_alpha=cfg.hp.lora_alpha,
+            lora_dropout=cfg.hp.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=ALL_LINEAR,
+            use_rslora=cfg.hp.get("use_rslora", True),
+        ))
+    return model
+
+
+def build_args(cfg: Config, hp: dict, out_dir: Path, for_hpo: bool = False) -> TrainingArguments:
+    """แยกออกมาจาก main() เพื่อให้ HPO ตั้งค่า hp ต่อ trial ได้ — เหมือน train_cpt.py"""
+    return TrainingArguments(
+        output_dir=str(out_dir),
+        per_device_train_batch_size=cfg.train.micro_batch_size,
+        per_device_eval_batch_size=cfg.train.micro_batch_size,
+        gradient_accumulation_steps=hp.get("grad_accum", cfg.hp.grad_accum),
+        num_train_epochs=1 if for_hpo else cfg.train.epochs,
+        max_steps=hp.get("max_steps", -1),
+        learning_rate=hp["learning_rate"],
+        lr_scheduler_type=hp.get("lr_scheduler", cfg.hp.lr_scheduler),
+        warmup_ratio=hp.get("warmup_ratio", cfg.hp.warmup_ratio),
+        weight_decay=hp.get("weight_decay", cfg.hp.weight_decay),
+        max_grad_norm=cfg.hp.max_grad_norm,
+        bf16=True,
+        fp16=False,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        optim="paged_adamw_8bit",
+        eval_strategy="steps",
+        # eval บนชุดเต็ม (1,137 ตัวอย่าง) ใช้เวลา ~12 นาทีต่อรอบ (วัดจากรันจริง) ถ้า eval
+        # ถี่แบบตอนเทรนจริง (ทุก 5 step) trial สั้น ๆ 80 step จะเสียเวลากับ eval 16 รอบ
+        # (~3 ชม.ต่อ trial!) — HPO จึงต้องทั้ง eval ห่างขึ้น (ทุก 20 step) และใช้ val subset
+        # เล็กลง (ดู make_objective ใน hpo_optuna_sft.py) พร้อมกันทั้งสองทาง
+        eval_steps=20 if for_hpo else cfg.train.eval_steps,
+        logging_steps=cfg.train.logging_steps,
+        save_strategy="no" if for_hpo else "steps",
+        save_steps=cfg.train.save_steps,
+        save_total_limit=2,
+        save_only_model=True,
+        load_best_model_at_end=False if for_hpo else True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        seed=cfg.seed,
+        data_seed=cfg.seed,
+        report_to=[],
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        group_by_length=True,
+        disable_tqdm=for_hpo,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/sft.yaml")
@@ -176,83 +258,14 @@ def main() -> int:
     val_ds = SFTDataset(data_dir / "val.jsonl", tok, cfg.data.max_len)
     LOG.info("train=%d คู่ | val=%d คู่ | max_len=%d", len(train_ds), len(val_ds), cfg.data.max_len)
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model.name,
-        quantization_config=bnb,
-        dtype=torch.bfloat16,
-        device_map={"": 0},
-        cache_dir=cfg.model.get("cache_dir"),
-    )
-    model.config.use_cache = False
-    model = prepare_model_for_kbit_training(
-        model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-
-    init_adapter = cfg.model.get("init_adapter")
-    if init_adapter and not args.no_init_adapter:
-        LOG.info("ต่อจาก adapter ของ CPT: %s", init_adapter)
-        model = PeftModel.from_pretrained(model, init_adapter, is_trainable=True)
-    else:
-        LOG.info("เริ่ม LoRA ใหม่จาก base (ไม่ได้ต่อจาก CPT)")
-        model = get_peft_model(model, LoraConfig(
-            r=cfg.hp.lora_r,
-            lora_alpha=cfg.hp.lora_alpha,
-            lora_dropout=cfg.hp.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=ALL_LINEAR,
-            use_rslora=cfg.hp.get("use_rslora", True),
-        ))
+    model = build_model(cfg, no_init_adapter=args.no_init_adapter)
 
     trainable, total = count_trainable(model)
     LOG.info("พารามิเตอร์ที่เทรน: %s / %s (%.3f%%)", f"{trainable:,}", f"{total:,}",
              100 * trainable / total)
     LOG.info(vram_report("after-load"))
 
-    targs = TrainingArguments(
-        output_dir=str(out_dir),
-        per_device_train_batch_size=cfg.train.micro_batch_size,
-        per_device_eval_batch_size=cfg.train.micro_batch_size,
-        gradient_accumulation_steps=cfg.hp.grad_accum,
-        num_train_epochs=cfg.train.epochs,
-        learning_rate=cfg.hp.learning_rate,
-        lr_scheduler_type=cfg.hp.lr_scheduler,
-        warmup_ratio=cfg.hp.warmup_ratio,
-        weight_decay=cfg.hp.weight_decay,
-        max_grad_norm=cfg.hp.max_grad_norm,
-        bf16=True,
-        fp16=False,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="paged_adamw_8bit",
-        eval_strategy="steps",
-        eval_steps=cfg.train.eval_steps,
-        logging_steps=cfg.train.logging_steps,
-        save_strategy="steps",
-        save_steps=cfg.train.save_steps,
-        save_total_limit=2,
-        # เซฟเฉพาะน้ำหนักโมเดล — การเซฟ optimizer state ของ paged_adamw_8bit
-        # ตรงกับจังหวะที่เครื่องแครช (BSOD nvlddmkm) ทุกครั้งในรอบ CPT ก่อนหน้า
-        save_only_model=True,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        seed=cfg.seed,
-        data_seed=cfg.seed,
-        report_to=[],
-        dataloader_num_workers=0,
-        remove_unused_columns=False,
-        # จัด batch ให้ความยาวใกล้กัน → dynamic padding ได้ผลดีขึ้นอีก
-        # (dataset นี้เป็น torch Dataset ไม่ใช่ datasets.Dataset — Trainer จะคำนวณ
-        #  ความยาวเองจาก input_ids ไม่ต้องมีคอลัมน์ length)
-        group_by_length=True,
-    )
+    targs = build_args(cfg, cfg.hp.to_dict(), out_dir)
 
     trainer = Trainer(
         model=model,
