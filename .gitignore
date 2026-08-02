@@ -7,12 +7,13 @@
 
 # ---- ผลลัพธ์การเทรน (ใหญ่, สร้างใหม่ได้) ----
 outputs/
-outputs_large/
-outputs_large_v2/
+outputs_large*/
 data/processed/
 data/processed_large/
 data/processed_large_v2/
 data/replay/*.jsonl
+# ข้อมูล SFT ที่กรองมาจาก Thaweewat/thai-med-pack — สร้างใหม่ได้ด้วย src/prepare_sft_data.py
+data/sft/
 # ไฟล์ wiki ที่ดึงมาเอง ใหญ่เกิน 100MB (ลิมิตของ GitHub) — regenerate ได้ด้วย prepare_data.py
 data/raw/wiki_domain.jsonl
 data/domain/wiki_domain.jsonl

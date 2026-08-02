@@ -66,13 +66,13 @@ LoRA adapter จากการทำ **Continued Pre-Training (CPT)** บน `t
 
 ## ⚠️ ข้อจำกัดที่ต้องอ่านก่อนใช้
 
-**สถานะ: งานทดลอง (smoke test) ไม่ใช่โมเดลที่พร้อมใช้งานจริง**
-
-- **คลังข้อมูลเล็กมาก** — เทรนบน {n_blocks} บล็อก ({n_tokens:,} token) เท่านั้น
-  CPT ที่เห็นผลจริงต้องการอย่างน้อย 10M token
-- **โมเดลยังหลอน (hallucinate) ข้อเท็จจริง** — จากการทดสอบด้วย generation probe
-  โมเดลยังแต่งชื่อทฤษฎีและปีงานวิจัยที่ไม่มีอยู่จริงขึ้นมาเอง
-  **PPL ที่ดีขึ้นเป็น noise ไม่ใช่การเรียนรู้** (validation set มีเพียง 1 บล็อก)
+- **คลังข้อมูล**: เทรนบน {n_blocks} บล็อก (~{n_tokens:,} token)
+  CPT ที่เห็นผลชัดมักต้องการระดับ 10M token ขึ้นไป — ต่ำกว่านั้นผลที่ได้จะเป็นระดับ
+  *สำนวนและคำศัพท์เฉพาะทาง* มากกว่าการฝังความรู้ทั้งก้อน
+- **ยังไม่ได้ตรวจสอบความถูกต้องเชิงข้อเท็จจริงของข้อความที่โมเดลสร้าง** สำหรับ checkpoint นี้
+  โมเดลภาษาโดยทั่วไปสามารถแต่งชื่อทฤษฎี ปีงานวิจัย หรือตัวเลขที่ไม่มีอยู่จริงได้
+  (ตรวจได้ด้วย `python main.py probe`)
+- **PPL ที่ดีขึ้นไม่ได้รับประกันความถูกต้องของเนื้อหา** — วัดแค่ว่าโมเดลทำนายข้อความในโดเมนได้ดีขึ้น
 - **ห้ามใช้เป็นแหล่งอ้างอิงทางการแพทย์หรือวิชาการโดยเด็ดขาด**
 - นี่คือ **base model ที่ผ่าน CPT** ไม่ใช่ instruct model — ใช้ต่อประโยค ไม่ใช่ตอบคำถาม
 - ยังไม่ได้ผ่าน SFT หรือ alignment ใด ๆ
@@ -160,9 +160,17 @@ def quality_gate(cfg: Config, adapter: Path, skip: bool) -> tuple[dict, dict]:
 def build_card(cfg: Config, repo: str, base: dict, tuned: dict, adapter: Path) -> str:
     import torch
 
+    # hp.json ถูกเขียนตอนเทรน "จบครบทุก epoch" เท่านั้น ถ้า push จาก checkpoint กลางทาง
+    # (เช่นหยุดเพราะ overfit แล้วเอา checkpoint ที่ดีที่สุด) จะไม่มีไฟล์นี้ →
+    # เดิม fallback เป็น "?" กับ grad_accum=16 ทำให้ model card แสดงค่าผิด
+    # ตอนนี้ถอยไปอ่านจาก cfg.hp ซึ่งเป็นค่าที่ใช้เทรนจริงเสมอ
     hp_path = adapter.parent / "hp.json"
-    hp = json.loads(hp_path.read_text(encoding="utf-8")) if hp_path.exists() else {}
-    eff = cfg.train.micro_batch_size * hp.get("grad_accum", 16)
+    if hp_path.exists():
+        hp = json.loads(hp_path.read_text(encoding="utf-8"))
+    else:
+        hp = cfg.hp.to_dict().copy()
+        LOG.info("ไม่พบ %s (น่าจะ push จาก checkpoint กลางทาง) → ใช้ค่า hp จาก config แทน", hp_path)
+    eff = cfg.train.micro_batch_size * hp.get("grad_accum", cfg.hp.get("grad_accum", 16))
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "n/a"
 
     def pct(a: float, b: float) -> float:
