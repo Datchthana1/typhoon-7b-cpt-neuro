@@ -8,6 +8,7 @@
 # ---- ผลลัพธ์การเทรน (ใหญ่, สร้างใหม่ได้) ----
 outputs/
 outputs_large*/
+outputs_sft*/
 data/processed/
 data/processed_large/
 data/processed_large_v2/
